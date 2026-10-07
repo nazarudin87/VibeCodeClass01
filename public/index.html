@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Todo Projects</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
+form{display:flex;gap:.5rem;margin:1rem 0}
+input[type=text]{flex:1;padding:.5rem}
+button{padding:.5rem .8rem;cursor:pointer}
+.project{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}
+.project-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.project-head h2{flex:1;margin:0;font-size:1.1rem;min-width:140px}
+.pct{font-variant-numeric:tabular-nums;font-weight:600}
+.pill{display:inline-block;padding:.15rem .5rem;border-radius:999px;font-size:.8rem;background:#f1f3f5;white-space:nowrap}
+.pill.done{background:#d3f9d8}
+.pill.prog{background:#fff3bf}
+.penguin{display:inline-block;font-size:1.4rem;line-height:1}
+.penguin.jump{animation:jump .6s ease infinite}
+.penguin.walk{display:inline-block;animation:walk 1.2s ease-in-out infinite}
+.penguin.sad{filter:grayscale(40%);opacity:.9}
+@keyframes jump{0%,100%{transform:translateY(0)}30%{transform:translateY(-12px)}60%{transform:translateY(-2px)}}
+@keyframes walk{0%,100%{transform:translateX(0) rotate(-8deg)}25%{transform:translateX(3px) rotate(8deg)}50%{transform:translateX(6px) rotate(-8deg)}75%{transform:translateX(3px) rotate(8deg)}}
+.bar{height:8px;background:#eee;border-radius:4px;overflow:hidden;margin:.5rem 0}
+.bar > div{height:100%;background:#2f9e44}
+ul{list-style:none;padding:0;margin:.5rem 0 0}
+li{display:flex;align-items:center;gap:.5rem;padding:.5rem 0;border-top:1px solid #f0f0f0}
+li.done span.name{text-decoration:line-through;color:#888}
+span.name{flex:1}
+input[type=range]{width:140px}
+.sub-form{display:flex;gap:.5rem;margin-top:.5rem}
+</style>
+</head>
+<body>
+<h1>Todo Projects</h1>
+<form id="add-project"><input id="new-project" type="text" placeholder="Add big project..." autocomplete="off" /><button type="submit">Add project</button></form>
+<div id="projects"></div>
+<script>
+const wrap = document.getElementById('projects');
+// sub-task ids recently completed -> expiry timestamp, keeps the jumping penguin visible across the reload
+const celebrate = new Map();
+function celebrateFor(id, ms){
+  celebrate.set(id, Date.now() + (ms || 2500));
+  setTimeout(() => {
+    const now = Date.now();
+    for (const entry of celebrate) { if (now >= entry[1]) celebrate.delete(entry[0]); }
+    load();
+  }, (ms || 2500) + 50);
+}
+function pruneCelebrations(){
+  const now = Date.now();
+  for (const entry of celebrate) { if (now >= entry[1]) celebrate.delete(entry[0]); }
+}
+// Project penguin rule: >=80 jumping, <=20 sad, 21-79 walking
+function projectPenguin(p){
+  if (p.progress >= 80) return { text: '🐧', cls: 'penguin jump', title: '80% and above — almost there!' };
+  if (p.progress <= 20) return { text: '🐧😞', cls: 'penguin sad', title: '20% and below — needs attention' };
+  return { text: '🐧', cls: 'penguin walk', title: 'In progress...' };
+}
+async function load(){
+  const res = await fetch('/api/projects');
+  const projects = await res.json();
+  render(projects);
+}
+function render(projects){
+  pruneCelebrations();
+  wrap.innerHTML = '';
+  for (const p of projects){
+    const inProgress = p.total - p.done;
+    const div = document.createElement('div');
+    div.className = 'project';
+    const head = document.createElement('div');
+    head.className = 'project-head';
+    const h = document.createElement('h2');
+    h.textContent = p.name;
+    h.title = 'Double-click to rename project';
+    h.ondblclick = async () => {
+      const name = prompt('Rename project:', p.name);
+      if (name && name.trim()){
+        await fetch('/api/items/'+p.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
+        load();
+      }
+    };
+    head.append(h);
+    const pg = projectPenguin(p);
+    if (pg) {
+      const pen = document.createElement('span');
+      pen.className = pg.cls;
+      pen.textContent = pg.text;
+      pen.title = pg.title;
+      head.append(pen);
+    }
+    const pct = document.createElement('span');
+    pct.className = 'pct';
+    pct.textContent = p.progress + '%';
+    head.append(pct);
+    const donePill = document.createElement('span');
+    donePill.className = 'pill done';
+    donePill.textContent = p.done + ' done';
+    head.append(donePill);
+    const progPill = document.createElement('span');
+    progPill.className = 'pill prog';
+    progPill.textContent = inProgress + ' in progress';
+    head.append(progPill);
+    const del = document.createElement('button');
+    del.textContent = 'Delete';
+    del.onclick = async () => {
+      if (!confirm('Delete project and its ' + p.total + ' sub-task(s)?')) return;
+      await fetch('/api/items/'+p.id,{method:'DELETE'});
+      load();
+    };
+    head.append(del);
+    div.append(head);
+    const meta = document.createElement('div');
+    meta.textContent = p.total === 0 ? 'No sub-tasks yet — add one below.' : p.done + ' / ' + p.total + ' sub-tasks done';
+    div.append(meta);
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fill = document.createElement('div');
+    fill.style.width = p.progress + '%';
+    bar.append(fill);
+    div.append(bar);
+    const ul = document.createElement('ul');
+    for (const s of (p.subtasks || [])){
+      const li = document.createElement('li');
+      if (s.completed) li.className = 'done';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = s.completed;
+      cb.onchange = async () => {
+        const res = await fetch('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({completed:cb.checked})});
+        if (res.ok && cb.checked) celebrateFor(s.id);
+        load();
+      };
+      const span = document.createElement('span');
+      span.className = 'name';
+      span.textContent = s.name;
+      span.title = 'Double-click to rename';
+      span.ondblclick = async () => {
+        const name = prompt('Rename sub-task:', s.name);
+        if (name && name.trim()){
+          await fetch('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
+          load();
+        }
+      };
+      const range = document.createElement('input');
+      range.type = 'range'; range.min = '0'; range.max = '100'; range.value = String(s.progress);
+      const lab = document.createElement('span');
+      lab.className = 'pct';
+      lab.textContent = s.progress + '%';
+      range.oninput = () => { lab.textContent = range.value + '%'; };
+      range.onchange = async () => {
+        const res = await fetch('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({progress:Number(range.value)})});
+        if (res.ok && Number(range.value) >= 100) celebrateFor(s.id);
+        load();
+      };
+      li.append(cb, span, range, lab);
+      if (celebrate.has(s.id)) {
+        const pen = document.createElement('span');
+        pen.className = 'penguin jump';
+        pen.textContent = '🐧';
+        pen.title = 'Sub-task completed!';
+        li.append(pen);
+      }
+      const rm = document.createElement('button');
+      rm.textContent = 'Delete';
+      rm.onclick = async () => { await fetch('/api/items/'+s.id,{method:'DELETE'}); load(); };
+      li.append(rm);
+      ul.append(li);
+    }
+    div.append(ul);
+    const sf = document.createElement('form');
+    sf.className = 'sub-form';
+    const si = document.createElement('input');
+    si.type = 'text'; si.placeholder = 'Add sub-task to "' + p.name + '"...';
+    const sb = document.createElement('button');
+    sb.textContent = 'Add task';
+    sf.append(si, sb);
+    sf.onsubmit = async (e) => {
+      e.preventDefault();
+      const name = si.value.trim();
+      if (!name) return;
+      await fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, parentId:p.id})});
+      load();
+    };
+    div.append(sf);
+    wrap.append(div);
+  }
+}
+document.getElementById('add-project').onsubmit = async (e) => {
+  e.preventDefault();
+  const el = document.getElementById('new-project');
+  const name = el.value.trim();
+  if (!name) return;
+  await fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  el.value = '';
+  load();
+};
+load();
+</script>
+</body>
+</html>
