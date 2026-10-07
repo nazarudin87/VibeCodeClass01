@@ -1,6 +1,12 @@
 import express from "express";
-import fs from "node:fs";
 import path from "node:path";
+import {
+  SUPABASE_ANON_KEY,
+  SUPABASE_URL,
+  isSupabaseConfigured,
+  supabaseAnon,
+  userClient,
+} from "./supabase.js";
 
 const app = express();
 
@@ -9,24 +15,36 @@ app.use(express.json());
 app.use(express.static(path.join(process.cwd(), "public")));
 
 type Todo = {
-  id: number;
+  id: string;
   name: string;
   completed: boolean;
   progress: number; // 0-100
-  parentId: number | null; // null = big project, number = sub-task
+  parentId: string | null; // null = big project, string = sub-task
   createdAt: string;
   updatedAt: string;
 };
 
-// Vercel serverless filesystem is read-only except /tmp (and ephemeral),
-// so writes fall back to /tmp there and never crash the request.
-const DATA_FILE =
-  process.env.VERCEL === "1"
-    ? path.join("/tmp", "todos.json")
-    : path.join(process.cwd(), "data", "todos.json");
+type DbTodo = {
+  id: string;
+  user_id: string;
+  name: string;
+  completed: boolean;
+  progress: number;
+  parent_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
 
-function nowIso(): string {
-  return new Date().toISOString();
+function toApi(r: DbTodo): Todo {
+  return {
+    id: r.id,
+    name: r.name,
+    completed: r.completed,
+    progress: r.progress,
+    parentId: r.parent_id,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
 }
 
 function clampProgress(n: unknown): number | null {
@@ -34,308 +52,384 @@ function clampProgress(n: unknown): number | null {
   return Math.min(100, Math.max(0, Math.round(n)));
 }
 
-function toTodo(raw: unknown, fallbackId: number): Todo | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  const id = typeof r.id === "number" ? r.id : fallbackId;
-  const name = typeof r.name === "string" ? r.name : "";
-  if (!name.trim()) return null;
-  const completedRaw = r.completed === true;
-  const progressRaw = clampProgress(r.progress);
-  const progress = progressRaw ?? (completedRaw ? 100 : 0);
-  const parentId = typeof r.parentId === "number" ? r.parentId : null;
-  return {
-    id,
-    name: name.trim(),
-    completed: progress >= 100 ? true : completedRaw && progress >= 100,
-    progress,
-    parentId,
-    createdAt: typeof r.createdAt === "string" ? r.createdAt : nowIso(),
-    updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : nowIso(),
-  };
-}
+// ---- auth ----
 
-function loadTodos(): Todo[] {
-  try {
-    if (!fs.existsSync(DATA_FILE)) return [{ id: 1, name: "hello world", completed: false, progress: 0, parentId: null, createdAt: nowIso(), updatedAt: nowIso() }];
-    const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8")) as unknown;
-    if (!Array.isArray(raw)) return [];
-    const todos: Todo[] = [];
-    let fallbackId = 1;
-    for (const entry of raw) {
-      const todo = toTodo(entry, fallbackId);
-      if (todo) {
-        // drop orphan subtasks whose parent is missing (repaired after load)
-        todos.push(todo);
-        fallbackId = Math.max(fallbackId, todo.id + 1);
-      }
-    }
-    const ids = new Set(todos.map((t) => t.id));
-    for (const t of todos) {
-      if (t.parentId !== null && !ids.has(t.parentId)) t.parentId = null;
-    }
-    // recompute project rollups so stored progress matches children
-    for (const t of todos) {
-      if (t.parentId === null) refreshProjectInPlace(todos, t.id);
-    }
-    return todos;
-  } catch {
-    return [{ id: 1, name: "hello world", completed: false, progress: 0, parentId: null, createdAt: nowIso(), updatedAt: nowIso() }];
+async function requireUser(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  if (!isSupabaseConfigured || !supabaseAnon) {
+    res.status(503).json({ error: "supabase not configured (SUPABASE_URL / SUPABASE_ANON_KEY)" });
+    return;
   }
+  const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) {
+    res.status(401).json({ error: "missing bearer token" });
+    return;
+  }
+  const { data, error } = await supabaseAnon.auth.getUser(token);
+  if (error || !data.user) {
+    res.status(401).json({ error: "invalid or expired token" });
+    return;
+  }
+  (req as unknown as { userId: string }).userId = data.user.id;
+  (req as unknown as { userToken: string }).userToken = token;
+  next();
 }
 
-function childrenOf(all: Todo[], projectId: number): Todo[] {
-  return all.filter((t) => t.parentId === projectId);
+function dbOf(req: express.Request) {
+  const { userId, userToken } = req as unknown as { userId: string; userToken: string };
+  const db = userClient(userToken);
+  return { db, userId };
 }
 
-function refreshProjectInPlace(all: Todo[], projectId: number): void {
-  const project = all.find((t) => t.id === projectId && t.parentId === null);
+// ---- rollup helpers (operate on the user's rows) ----
+
+function childrenOf(all: DbTodo[], projectId: string): DbTodo[] {
+  return all.filter((t) => t.parent_id === projectId);
+}
+
+async function refreshProject(
+  db: ReturnType<typeof userClient>,
+  userId: string,
+  all: DbTodo[],
+  projectId: string,
+): Promise<void> {
+  const project = all.find((t) => t.id === projectId && t.parent_id === null);
   if (!project) return;
   const children = childrenOf(all, projectId);
   if (children.length === 0) return; // standalone project keeps its own progress
   const avg = Math.round(children.reduce((s, c) => s + c.progress, 0) / children.length);
-  project.progress = avg;
-  project.completed = children.every((c) => c.completed);
-  project.updatedAt = nowIso();
-}
-
-let todos: Todo[] = loadTodos();
-let nextId = todos.reduce((m, t) => Math.max(m, t.id + 1), 1);
-
-function saveTodos(): void {
-  try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(todos, null, 2) + "\n");
-  } catch {
-    // Filesystem may be read-only/ephemeral (e.g. Vercel serverless);
-    // the API keeps serving in-memory data instead of crashing.
+  const completed = children.every((c) => c.completed);
+  const { error } = await db
+    .from("todos")
+    .update({ progress: avg, completed, updated_at: new Date().toISOString() })
+    .eq("id", projectId)
+    .eq("user_id", userId);
+  if (!error) {
+    project.progress = avg;
+    project.completed = completed;
   }
 }
 
-// Persist seed on first run so restart keeps data
-try {
-  if (!fs.existsSync(DATA_FILE)) saveTodos();
-} catch {
-  // ignore seed persistence errors; API still serves in-memory
+async function listAll(db: ReturnType<typeof userClient>, userId: string): Promise<DbTodo[]> {
+  const { data, error } = await db
+    .from("todos")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as DbTodo[];
 }
 
-function projectView(project: Todo) {
-  const subtasks = childrenOf(todos, project.id);
+function projectView(all: DbTodo[], project: DbTodo) {
+  const subtasks = childrenOf(all, project.id).map(toApi);
   const total = subtasks.length;
   const done = subtasks.filter((s) => s.completed).length;
-  return { ...project, total, done, subtasks };
+  return { ...toApi(project), total, done, subtasks };
 }
 
+// ---- public routes ----
+
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, supabase: isSupabaseConfigured });
 });
+
+// Public Supabase credentials for the browser (anon key is public by design).
+app.get("/api/config", (_req, res) => {
+  if (!isSupabaseConfigured) {
+    res.status(503).json({ error: "supabase not configured" });
+    return;
+  }
+  res.json({ url: SUPABASE_URL, anonKey: SUPABASE_ANON_KEY });
+});
+
+// ---- protected routes (per-user todos) ----
 
 // Aggregated view: big projects with rollup progress + subtasks
-app.get("/api/projects", (_req, res) => {
-  res.json(todos.filter((t) => t.parentId === null).map(projectView));
+app.get("/api/projects", requireUser, async (req, res) => {
+  try {
+    const { db, userId } = dbOf(req);
+    const all = await listAll(db, userId);
+    res.json(all.filter((t) => t.parent_id === null).map((p) => projectView(all, p)));
+  } catch {
+    res.status(500).json({ error: "failed to load projects" });
+  }
 });
 
-app.get("/api/items", (req, res) => {
-  const { completed, parentId } = req.query;
-  let result = todos;
-  if (parentId !== undefined) {
-    if (parentId === "null") {
-      result = result.filter((t) => t.parentId === null);
-    } else {
-      const pid = Number(parentId);
-      if (!Number.isInteger(pid)) {
+app.get("/api/items", requireUser, async (req, res) => {
+  try {
+    const { db, userId } = dbOf(req);
+    const all = await listAll(db, userId);
+    let result = all;
+    const { completed, parentId } = req.query;
+    if (parentId !== undefined) {
+      if (parentId === "null") {
+        result = result.filter((t) => t.parent_id === null);
+      } else if (typeof parentId === "string" && parentId !== "") {
+        result = result.filter((t) => t.parent_id === parentId);
+      } else {
         res.status(400).json({ error: "parentId must be an id or 'null'" });
         return;
       }
-      result = result.filter((t) => t.parentId === pid);
     }
-  }
-  if (completed !== undefined) {
-    if (completed !== "true" && completed !== "false") {
-      res.status(400).json({ error: "completed query must be 'true' or 'false'" });
-      return;
+    if (completed !== undefined) {
+      if (completed !== "true" && completed !== "false") {
+        res.status(400).json({ error: "completed query must be 'true' or 'false'" });
+        return;
+      }
+      const flag = completed === "true";
+      result = result.filter((t) => t.completed === flag);
     }
-    const flag = completed === "true";
-    result = result.filter((t) => t.completed === flag);
+    res.json(result.map(toApi));
+  } catch {
+    res.status(500).json({ error: "failed to load items" });
   }
-  res.json(result);
 });
 
-app.post("/api/items", (req, res) => {
-  const name = String(req.body?.name ?? "").trim();
-  if (!name) {
-    res.status(400).json({ error: "name is required" });
-    return;
-  }
-  let parentId: number | null = null;
-  if (req.body?.parentId !== undefined && req.body?.parentId !== null) {
-    const pid = Number(req.body.parentId);
-    if (!Number.isInteger(pid)) {
-      res.status(400).json({ error: "parentId must be a project id" });
-      return;
-    }
-    const parent = todos.find((t) => t.id === pid && t.parentId === null);
-    if (!parent) {
-      res.status(400).json({ error: "parent project not found (sub-tasks can only belong to a big project)" });
-      return;
-    }
-    parentId = pid;
-  }
-  let progress = 0;
-  if (req.body?.progress !== undefined) {
-    const p = clampProgress(req.body.progress);
-    if (p === null) {
-      res.status(400).json({ error: "progress must be a number 0-100" });
-      return;
-    }
-    progress = p;
-  } else if (req.body?.completed === true) {
-    progress = 100;
-  } else if (req.body?.completed !== undefined && typeof req.body.completed !== "boolean") {
-    res.status(400).json({ error: "completed must be a boolean" });
-    return;
-  }
-  const timestamp = nowIso();
-  const item: Todo = {
-    id: nextId++,
-    name,
-    completed: progress >= 100,
-    progress,
-    parentId,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-  todos.push(item);
-  if (parentId !== null) refreshProjectInPlace(todos, parentId);
-  saveTodos();
-  res.status(201).json(item);
-});
-
-app.get("/api/items/:id", (req, res) => {
-  const item = todos.find((i) => i.id === Number(req.params.id));
-  if (!item) {
-    res.status(404).json({ error: "not found" });
-    return;
-  }
-  if (item.parentId === null) {
-    refreshProjectInPlace(todos, item.id);
-    res.json(projectView(item));
-    return;
-  }
-  res.json(item);
-});
-
-app.patch("/api/items/:id", (req, res) => {
-  const item = todos.find((i) => i.id === Number(req.params.id));
-  if (!item) {
-    res.status(404).json({ error: "not found" });
-    return;
-  }
-  const isRollupProject = item.parentId === null && childrenOf(todos, item.id).length > 0;
-  const hasName = req.body?.name !== undefined;
-  const hasCompleted = req.body?.completed !== undefined;
-  const hasProgress = req.body?.progress !== undefined;
-  if (!hasName && !hasCompleted && !hasProgress) {
-    res.status(400).json({ error: "provide name, completed and/or progress" });
-    return;
-  }
-  if (hasName) {
-    const name = String(req.body.name ?? "").trim();
+app.post("/api/items", requireUser, async (req, res) => {
+  try {
+    const { db, userId } = dbOf(req);
+    const name = String(req.body?.name ?? "").trim();
     if (!name) {
-      res.status(400).json({ error: "name must be a non-empty string" });
+      res.status(400).json({ error: "name is required" });
       return;
     }
-    item.name = name;
-  }
-  if (hasProgress) {
-    if (isRollupProject) {
-      res.status(400).json({ error: "project progress is computed from its sub-tasks" });
-      return;
+    let parent_id: string | null = null;
+    if (req.body?.parentId !== undefined && req.body?.parentId !== null && req.body?.parentId !== "") {
+      const pid = String(req.body.parentId);
+      const { data: parent, error: parentErr } = await db
+        .from("todos")
+        .select("id,parent_id")
+        .eq("id", pid)
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (parentErr || !parent || (parent as DbTodo).parent_id !== null) {
+        res.status(400).json({ error: "parent project not found (sub-tasks can only belong to a big project)" });
+        return;
+      }
+      parent_id = pid;
     }
-    const p = clampProgress(req.body.progress);
-    if (p === null) {
-      res.status(400).json({ error: "progress must be a number 0-100" });
-      return;
-    }
-    item.progress = p;
-    item.completed = p >= 100;
-  }
-  if (hasCompleted) {
-    if (typeof req.body.completed !== "boolean") {
+    let progress = 0;
+    if (req.body?.progress !== undefined) {
+      const p = clampProgress(req.body.progress);
+      if (p === null) {
+        res.status(400).json({ error: "progress must be a number 0-100" });
+        return;
+      }
+      progress = p;
+    } else if (req.body?.completed === true) {
+      progress = 100;
+    } else if (req.body?.completed !== undefined && typeof req.body.completed !== "boolean") {
       res.status(400).json({ error: "completed must be a boolean" });
       return;
     }
-    if (isRollupProject) {
-      res.status(400).json({ error: "project completion is computed from its sub-tasks" });
+    const { data, error } = await db
+      .from("todos")
+      .insert({ user_id: userId, name, completed: progress >= 100, progress, parent_id })
+      .select("*")
+      .single();
+    if (error || !data) {
+      res.status(500).json({ error: "failed to create item" });
       return;
     }
-    // completed flag stays in sync with progress
-    if (!hasProgress) {
-      item.completed = req.body.completed;
-      item.progress = req.body.completed ? 100 : item.progress >= 100 ? 0 : item.progress;
-    } else {
-      item.completed = item.progress >= 100 ? true : req.body.completed && item.progress >= 100;
-      if (req.body.completed && item.progress < 100) {
-        // explicit complete wins over a partial progress in the same request
-        item.progress = 100;
-        item.completed = true;
+    if (parent_id !== null) {
+      const all = await listAll(db, userId);
+      await refreshProject(db, userId, all, parent_id);
+    }
+    res.status(201).json(toApi(data as DbTodo));
+  } catch {
+    res.status(500).json({ error: "failed to create item" });
+  }
+});
+
+app.get("/api/items/:id", requireUser, async (req, res) => {
+  try {
+    const { db, userId } = dbOf(req);
+    const { data, error } = await db
+      .from("todos")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error || !data) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    const item = data as DbTodo;
+    if (item.parent_id === null) {
+      const all = await listAll(db, userId);
+      await refreshProject(db, userId, all, item.id);
+      const fresh = all.find((t) => t.id === item.id) ?? item;
+      res.json(projectView(all, fresh));
+      return;
+    }
+    res.json(toApi(item));
+  } catch {
+    res.status(500).json({ error: "failed to load item" });
+  }
+});
+
+app.patch("/api/items/:id", requireUser, async (req, res) => {
+  try {
+    const { db, userId } = dbOf(req);
+    const { data: row, error: fetchErr } = await db
+      .from("todos")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (fetchErr || !row) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    const item = row as DbTodo;
+    const all = await listAll(db, userId);
+    const isRollupProject =
+      item.parent_id === null && childrenOf(all, item.id).length > 0;
+    const hasName = req.body?.name !== undefined;
+    const hasCompleted = req.body?.completed !== undefined;
+    const hasProgress = req.body?.progress !== undefined;
+    if (!hasName && !hasCompleted && !hasProgress) {
+      res.status(400).json({ error: "provide name, completed and/or progress" });
+      return;
+    }
+    const patch: Partial<DbTodo> = {};
+    if (hasName) {
+      const name = String(req.body.name ?? "").trim();
+      if (!name) {
+        res.status(400).json({ error: "name must be a non-empty string" });
+        return;
       }
-      if (!req.body.completed && item.progress >= 100) {
-        item.progress = 0;
-        item.completed = false;
+      patch.name = name;
+    }
+    let progress = item.progress;
+    let completed = item.completed;
+    if (hasProgress) {
+      if (isRollupProject) {
+        res.status(400).json({ error: "project progress is computed from its sub-tasks" });
+        return;
+      }
+      const p = clampProgress(req.body.progress);
+      if (p === null) {
+        res.status(400).json({ error: "progress must be a number 0-100" });
+        return;
+      }
+      progress = p;
+      completed = p >= 100;
+    }
+    if (hasCompleted) {
+      if (typeof req.body.completed !== "boolean") {
+        res.status(400).json({ error: "completed must be a boolean" });
+        return;
+      }
+      if (isRollupProject) {
+        res.status(400).json({ error: "project completion is computed from its sub-tasks" });
+        return;
+      }
+      if (!hasProgress) {
+        completed = req.body.completed;
+        progress = req.body.completed ? 100 : progress >= 100 ? 0 : progress;
+      } else if (req.body.completed && progress < 100) {
+        progress = 100;
+        completed = true;
+      } else if (!req.body.completed && progress >= 100) {
+        progress = 0;
+        completed = false;
       }
     }
+    const { data: updated, error: updateErr } = await db
+      .from("todos")
+      .update({
+        ...(patch.name !== undefined ? { name: patch.name } : {}),
+        progress,
+        completed,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", item.id)
+      .eq("user_id", userId)
+      .select("*")
+      .single();
+    if (updateErr || !updated) {
+      res.status(500).json({ error: "failed to update item" });
+      return;
+    }
+    const saved = updated as DbTodo;
+    if (saved.parent_id !== null) {
+      const fresh = await listAll(db, userId);
+      await refreshProject(db, userId, fresh, saved.parent_id);
+      res.json(toApi(saved));
+      return;
+    }
+    const fresh = await listAll(db, userId);
+    const current = fresh.find((t) => t.id === saved.id) ?? saved;
+    res.json(projectView(fresh, current));
+  } catch {
+    res.status(500).json({ error: "failed to update item" });
   }
-  item.updatedAt = nowIso();
-  if (item.parentId !== null) refreshProjectInPlace(todos, item.parentId);
-  saveTodos();
-  if (item.parentId === null) {
-    res.json(projectView(item));
-    return;
-  }
-  res.json(item);
 });
 
-app.delete("/api/items/:id", (req, res) => {
-  const id = Number(req.params.id);
-  const target = todos.find((i) => i.id === id);
-  if (!target) {
-    res.status(404).json({ error: "not found" });
-    return;
+app.delete("/api/items/:id", requireUser, async (req, res) => {
+  try {
+    const { db, userId } = dbOf(req);
+    const { data: target, error: fetchErr } = await db
+      .from("todos")
+      .select("id,parent_id")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (fetchErr || !target) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    const t = target as Pick<DbTodo, "id" | "parent_id">;
+    // big project: DB foreign key cascades to its sub-tasks
+    const { error: delErr } = await db
+      .from("todos")
+      .delete()
+      .eq("id", t.id)
+      .eq("user_id", userId);
+    if (delErr) {
+      res.status(500).json({ error: "failed to delete item" });
+      return;
+    }
+    if (t.parent_id !== null) {
+      const fresh = await listAll(db, userId);
+      await refreshProject(db, userId, fresh, t.parent_id);
+    }
+    res.status(204).end();
+  } catch {
+    res.status(500).json({ error: "failed to delete item" });
   }
-  const parentId = target.parentId;
-  if (target.parentId === null) {
-    // big project: cascade delete its sub-tasks
-    todos = todos.filter((i) => i.id !== id && i.parentId !== id);
-  } else {
-    todos = todos.filter((i) => i.id !== id);
-  }
-  if (parentId !== null) {
-    const parent = todos.find((t) => t.id === parentId && t.parentId === null);
-    if (parent) refreshProjectInPlace(todos, parentId);
-  }
-  saveTodos();
-  res.status(204).end();
 });
 
-app.delete("/api/items", (req, res) => {
-  if (req.query.completed !== "true") {
-    res.status(400).json({ error: "use DELETE /api/items?completed=true to clear completed" });
-    return;
+app.delete("/api/items", requireUser, async (req, res) => {
+  try {
+    if (req.query.completed !== "true") {
+      res.status(400).json({ error: "use DELETE /api/items?completed=true to clear completed" });
+      return;
+    }
+    const { db, userId } = dbOf(req);
+    const { data: gone, error: delErr } = await db
+      .from("todos")
+      .delete()
+      .eq("completed", true)
+      .eq("user_id", userId)
+      .select("id");
+    if (delErr) {
+      res.status(500).json({ error: "failed to clear completed" });
+      return;
+    }
+    const deleted = (gone ?? []).length;
+    const fresh = await listAll(db, userId);
+    for (const t of fresh) {
+      if (t.parent_id === null) await refreshProject(db, userId, fresh, t.id);
+    }
+    res.json({ deleted });
+  } catch {
+    res.status(500).json({ error: "failed to clear completed" });
   }
-  const before = todos.length;
-  todos = todos.filter((t) => !t.completed);
-  const deleted = before - todos.length;
-  // repair orphans + refresh rollups after bulk delete
-  const ids = new Set(todos.map((t) => t.id));
-  for (const t of todos) {
-    if (t.parentId !== null && !ids.has(t.parentId)) t.parentId = null;
-  }
-  for (const t of todos) {
-    if (t.parentId === null) refreshProjectInPlace(todos, t.id);
-  }
-  saveTodos();
-  res.json({ deleted });
 });
 
 export default app;

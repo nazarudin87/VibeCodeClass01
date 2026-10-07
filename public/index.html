@@ -7,7 +7,7 @@
 <style>
 body{font-family:system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
 form{display:flex;gap:.5rem;margin:1rem 0}
-input[type=text]{flex:1;padding:.5rem}
+input[type=text],input[type=email],input[type=password]{flex:1;padding:.5rem}
 button{padding:.5rem .8rem;cursor:pointer}
 .project{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}
 .project-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
@@ -30,15 +30,70 @@ li.done span.name{text-decoration:line-through;color:#888}
 span.name{flex:1}
 input[type=range]{width:140px}
 .sub-form{display:flex;gap:.5rem;margin-top:.5rem}
+.auth-box{border:1px solid #ddd;border-radius:8px;padding:1rem;max-width:420px}
+.auth-box form{flex-direction:column}
+.tabs{display:flex;gap:.5rem;margin-bottom:.5rem}
+.tabs button.active{font-weight:700}
+#auth-msg{min-height:1.5em;color:#a61e4d}
+#user-bar{display:flex;align-items:center;gap:.5rem;justify-content:flex-end;font-size:.9rem}
 </style>
 </head>
 <body>
 <h1>Todo Projects</h1>
-<form id="add-project"><input id="new-project" type="text" placeholder="Add big project..." autocomplete="off" /><button type="submit">Add project</button></form>
-<div id="projects"></div>
-<script>
+
+<div id="auth-view" hidden>
+  <div class="auth-box">
+    <div class="tabs">
+      <button id="tab-signin" class="active" type="button">Sign in</button>
+      <button id="tab-signup" type="button">Sign up</button>
+      <button id="tab-forgot" type="button">Forgot password</button>
+    </div>
+    <div id="auth-msg"></div>
+    <form id="form-signin">
+      <input id="in-email" type="email" placeholder="Email" autocomplete="email" required />
+      <input id="in-password" type="password" placeholder="Password" autocomplete="current-password" required />
+      <button type="submit">Sign in</button>
+    </form>
+    <form id="form-signup" hidden>
+      <input id="up-email" type="email" placeholder="Email" autocomplete="email" required />
+      <input id="up-password" type="password" placeholder="Password (min 6 chars)" autocomplete="new-password" required />
+      <button type="submit">Create account</button>
+    </form>
+    <form id="form-forgot" hidden>
+      <input id="forgot-email" type="email" placeholder="Email" autocomplete="email" required />
+      <button type="submit">Send reset link</button>
+    </form>
+  </div>
+</div>
+
+<div id="new-password-view" hidden>
+  <div class="auth-box">
+    <h2>Set a new password</h2>
+    <div id="pw-msg"></div>
+    <form id="form-new-password">
+      <input id="new-password" type="password" placeholder="New password" autocomplete="new-password" required />
+      <input id="new-password2" type="password" placeholder="Confirm new password" autocomplete="new-password" required />
+      <button type="submit">Update password</button>
+    </form>
+  </div>
+</div>
+
+<div id="app-view" hidden>
+  <div id="user-bar"><span>Signed in as <b id="user-email"></b></span><button id="logout" type="button">Log out</button></div>
+  <form id="add-project"><input id="new-project" type="text" placeholder="Add big project..." autocomplete="off" /><button type="submit">Add project</button></form>
+  <div id="projects"></div>
+</div>
+
+<script type="module">
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+const authView = document.getElementById('auth-view');
+const appView = document.getElementById('app-view');
+const pwView = document.getElementById('new-password-view');
+const authMsg = document.getElementById('auth-msg');
 const wrap = document.getElementById('projects');
-// sub-task ids recently completed -> expiry timestamp, keeps the jumping penguin visible across the reload
+
+let sb = null;
 const celebrate = new Map();
 function celebrateFor(id, ms){
   celebrate.set(id, Date.now() + (ms || 2500));
@@ -58,11 +113,42 @@ function projectPenguin(p){
   if (p.progress <= 20) return { text: '🐧😞', cls: 'penguin sad', title: '20% and below — needs attention' };
   return { text: '🐧', cls: 'penguin walk', title: 'In progress...' };
 }
-async function load(){
-  const res = await fetch('/api/projects');
-  const projects = await res.json();
-  render(projects);
+
+function showAuth(msg){
+  authView.hidden = false; appView.hidden = true; pwView.hidden = true;
+  if (msg) authMsg.textContent = msg;
 }
+function showApp(user){
+  authView.hidden = true; appView.hidden = false; pwView.hidden = true;
+  document.getElementById('user-email').textContent = user?.email || '';
+  load();
+}
+function showNewPassword(msg){
+  authView.hidden = true; appView.hidden = true; pwView.hidden = false;
+  if (msg) document.getElementById('pw-msg').textContent = msg;
+}
+
+async function api(path, opts){
+  opts = opts || {};
+  const { data: { session } } = await sb.auth.getSession();
+  const headers = Object.assign({}, opts.headers || {});
+  if (session && session.access_token) headers['Authorization'] = 'Bearer ' + session.access_token;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (res.status === 401) {
+    showAuth('Session expired — please sign in again.');
+    throw new Error('unauthorized');
+  }
+  return res;
+}
+
+async function load(){
+  try {
+    const res = await api('/api/projects');
+    const projects = await res.json();
+    render(projects);
+  } catch (e) { /* auth view already shown on 401 */ }
+}
+
 function render(projects){
   pruneCelebrations();
   wrap.innerHTML = '';
@@ -78,7 +164,7 @@ function render(projects){
     h.ondblclick = async () => {
       const name = prompt('Rename project:', p.name);
       if (name && name.trim()){
-        await fetch('/api/items/'+p.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
+        await api('/api/items/'+p.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
         load();
       }
     };
@@ -107,7 +193,7 @@ function render(projects){
     del.textContent = 'Delete';
     del.onclick = async () => {
       if (!confirm('Delete project and its ' + p.total + ' sub-task(s)?')) return;
-      await fetch('/api/items/'+p.id,{method:'DELETE'});
+      await api('/api/items/'+p.id,{method:'DELETE'});
       load();
     };
     head.append(del);
@@ -128,7 +214,7 @@ function render(projects){
       const cb = document.createElement('input');
       cb.type = 'checkbox'; cb.checked = s.completed;
       cb.onchange = async () => {
-        const res = await fetch('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({completed:cb.checked})});
+        const res = await api('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({completed:cb.checked})});
         if (res.ok && cb.checked) celebrateFor(s.id);
         load();
       };
@@ -139,7 +225,7 @@ function render(projects){
       span.ondblclick = async () => {
         const name = prompt('Rename sub-task:', s.name);
         if (name && name.trim()){
-          await fetch('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
+          await api('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
           load();
         }
       };
@@ -150,7 +236,7 @@ function render(projects){
       lab.textContent = s.progress + '%';
       range.oninput = () => { lab.textContent = range.value + '%'; };
       range.onchange = async () => {
-        const res = await fetch('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({progress:Number(range.value)})});
+        const res = await api('/api/items/'+s.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({progress:Number(range.value)})});
         if (res.ok && Number(range.value) >= 100) celebrateFor(s.id);
         load();
       };
@@ -164,7 +250,7 @@ function render(projects){
       }
       const rm = document.createElement('button');
       rm.textContent = 'Delete';
-      rm.onclick = async () => { await fetch('/api/items/'+s.id,{method:'DELETE'}); load(); };
+      rm.onclick = async () => { await api('/api/items/'+s.id,{method:'DELETE'}); load(); };
       li.append(rm);
       ul.append(li);
     }
@@ -173,30 +259,127 @@ function render(projects){
     sf.className = 'sub-form';
     const si = document.createElement('input');
     si.type = 'text'; si.placeholder = 'Add sub-task to "' + p.name + '"...';
-    const sb = document.createElement('button');
-    sb.textContent = 'Add task';
-    sf.append(si, sb);
+    const sbb = document.createElement('button');
+    sbb.textContent = 'Add task';
+    sf.append(si, sbb);
     sf.onsubmit = async (e) => {
       e.preventDefault();
       const name = si.value.trim();
       if (!name) return;
-      await fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, parentId:p.id})});
+      await api('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, parentId:p.id})});
       load();
     };
     div.append(sf);
     wrap.append(div);
   }
 }
+
+// ---- auth wiring ----
+
+function switchTab(which){
+  for (const t of ['signin','signup','forgot']) {
+    document.getElementById('tab-'+t).classList.toggle('active', t === which);
+    document.getElementById('form-'+t).hidden = t !== which;
+  }
+  authMsg.textContent = '';
+}
+document.getElementById('tab-signin').onclick = () => switchTab('signin');
+document.getElementById('tab-signup').onclick = () => switchTab('signup');
+document.getElementById('tab-forgot').onclick = () => switchTab('forgot');
+
+document.getElementById('form-signin').onsubmit = async (e) => {
+  e.preventDefault();
+  authMsg.textContent = 'Signing in...';
+  const { error } = await sb.auth.signInWithPassword({
+    email: document.getElementById('in-email').value.trim(),
+    password: document.getElementById('in-password').value,
+  });
+  authMsg.textContent = error ? error.message : '';
+};
+
+document.getElementById('form-signup').onsubmit = async (e) => {
+  e.preventDefault();
+  authMsg.textContent = 'Creating account...';
+  const { data, error } = await sb.auth.signUp({
+    email: document.getElementById('up-email').value.trim(),
+    password: document.getElementById('up-password').value,
+  });
+  authMsg.textContent = error ? error.message
+    : (!data.session ? 'Check your email to confirm your account, then sign in.' : '');
+};
+
+document.getElementById('form-forgot').onsubmit = async (e) => {
+  e.preventDefault();
+  authMsg.textContent = 'Sending reset link...';
+  const { error } = await sb.auth.resetPasswordForEmail(
+    document.getElementById('forgot-email').value.trim(),
+    { redirectTo: window.location.origin + '/' },
+  );
+  authMsg.textContent = error ? error.message : 'Reset link sent — check your email.';
+};
+
+document.getElementById('form-new-password').onsubmit = async (e) => {
+  e.preventDefault();
+  const a = document.getElementById('new-password').value;
+  const b = document.getElementById('new-password2').value;
+  const msg = document.getElementById('pw-msg');
+  if (a !== b) { msg.textContent = 'Passwords do not match.'; return; }
+  msg.textContent = 'Updating...';
+  const { error } = await sb.auth.updateUser({ password: a });
+  if (error) { msg.textContent = error.message; return; }
+  msg.textContent = '';
+  window.history.replaceState({}, '', window.location.pathname);
+  const { data: { session } } = await sb.auth.getSession();
+  if (session) showApp(session.user);
+};
+
+document.getElementById('logout').onclick = async () => {
+  await sb.auth.signOut();
+  showAuth();
+};
+
 document.getElementById('add-project').onsubmit = async (e) => {
   e.preventDefault();
   const el = document.getElementById('new-project');
   const name = el.value.trim();
   if (!name) return;
-  await fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  await api('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
   el.value = '';
   load();
 };
-load();
+
+async function init(){
+  let cfg;
+  try {
+    const res = await fetch('/api/config');
+    cfg = await res.json();
+    if (!res.ok) throw new Error(cfg.error || 'config failed');
+  } catch (e) {
+    showAuth('Server is not linked to Supabase (SUPABASE_URL / SUPABASE_ANON_KEY missing).');
+    return;
+  }
+  sb = createClient(cfg.url, cfg.anonKey);
+
+  sb.auth.onAuthStateChange((event, session) => {
+    if (event === 'PASSWORD_RECOVERY') showNewPassword();
+    else if (session) showApp(session.user);
+    else showAuth();
+  });
+
+  // PKCE recovery link (?code=...) from the reset email
+  const code = new URLSearchParams(window.location.search).get('code');
+  if (code) {
+    const { error } = await sb.auth.exchangeCodeForSession(code);
+    window.history.replaceState({}, '', window.location.pathname);
+    if (error) { showAuth(error.message); return; }
+    showNewPassword();
+    return;
+  }
+  const { data: { session } } = await sb.auth.getSession();
+  if (session) showApp(session.user);
+  else showAuth();
+}
+init();
 </script>
 </body>
 </html>
